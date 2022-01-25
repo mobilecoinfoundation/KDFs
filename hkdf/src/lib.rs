@@ -83,7 +83,7 @@
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/RustCrypto/media/6ee8e381/logo.svg",
     html_favicon_url = "https://raw.githubusercontent.com/RustCrypto/media/6ee8e381/logo.svg",
-    html_root_url = "https://docs.rs/hkdf/0.12.0"
+    html_root_url = "https://docs.rs/hkdf/0.12.1-pre.0"
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![forbid(unsafe_code)]
@@ -100,9 +100,9 @@ use hmac::digest::{
         OutputSizeUser, UpdateCore,
     },
     generic_array::typenum::{IsLess, Le, NonZero, Unsigned, U256},
-    FixedOutput, HashMarker, KeyInit, Output, Update,
+    Digest, FixedOutput, HashMarker, KeyInit, Output, Update,
 };
-use hmac::{Hmac, HmacCore};
+use hmac::{Hmac, HmacCore, SimpleHmac};
 
 /// Error that is returned when supplied pseudorandom key (PRK) is not long enough.
 #[derive(Copy, Clone, Debug)]
@@ -340,3 +340,134 @@ impl fmt::Display for InvalidLength {
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 impl ::std::error::Error for InvalidLength {}
+
+
+/// Simplified HKDF-Extract variant able to operate over hash functions
+/// which do not expose block-level API and hash functions which
+/// process blocks lazily (e.g. BLAKE2).
+#[derive(Clone)]
+pub struct SimpleHkdfExtract<D>
+    where
+        D: Digest + BlockSizeUser + Clone,
+{
+    hmac: SimpleHmac<D>,
+}
+
+impl<D> SimpleHkdfExtract<D>
+    where
+        D: Digest + BlockSizeUser + Clone,
+{
+    /// Initiates the HKDF-Extract context with the given optional salt
+    pub fn new(salt: Option<&[u8]>) -> SimpleHkdfExtract<D> {
+        let default_salt = Output::<D>::default();
+        let salt = salt.unwrap_or(&default_salt);
+        let hmac = SimpleHmac::<D>::new_from_slice(salt).expect("HMAC can take a key of any size");
+        SimpleHkdfExtract { hmac }
+    }
+
+    /// Feeds in additional input key material to the HKDF-Extract context
+    pub fn input_ikm(&mut self, ikm: &[u8]) {
+        self.hmac.update(ikm);
+    }
+
+    /// Completes the HKDF-Extract operation, returning both the generated pseudorandom key and
+    /// `Hkdf` struct for expanding.
+    pub fn finalize(self) -> (Output<D>, SimpleHkdf<D>) {
+        let prk = self.hmac.finalize_fixed();
+        let hkdf = SimpleHkdf::from_prk(&prk).expect("PRK size is correct");
+        (prk, hkdf)
+    }
+}
+
+/// Simplified HKDF variant able to operate over hash functions
+/// which do not expose block-level API and hash functions which
+/// process blocks lazily (e.g. BLAKE2).
+#[derive(Clone, Debug)]
+pub struct SimpleHkdf<D>
+    where
+        D: Digest + BlockSizeUser + Clone,
+{
+    hmac: SimpleHmac<D>,
+}
+
+impl<D> SimpleHkdf<D>
+    where
+        D: Digest + BlockSizeUser + Clone,
+{
+    /// Convenience method for [`extract`][Hkdf::extract] when the generated
+    /// pseudorandom key can be ignored and only HKDF-Expand operation is needed. This is the most
+    /// common constructor.
+    pub fn new(salt: Option<&[u8]>, ikm: &[u8]) -> SimpleHkdf<D> {
+        let (_, hkdf) = SimpleHkdf::extract(salt, ikm);
+        hkdf
+    }
+
+    /// Create `Hkdf` from an already cryptographically strong pseudorandom key
+    /// as per section 3.3 from RFC5869.
+    pub fn from_prk(prk: &[u8]) -> Result<SimpleHkdf<D>, InvalidPrkLength> {
+        // section 2.3 specifies that prk must be "at least HashLen octets"
+        if prk.len() < <D as OutputSizeUser>::OutputSize::to_usize() {
+            return Err(InvalidPrkLength);
+        }
+
+        Ok(SimpleHkdf {
+            hmac: SimpleHmac::new_from_slice(prk).expect("HMAC can take a key of any size"),
+        })
+    }
+
+    /// The RFC5869 HKDF-Extract operation returning both the generated
+    /// pseudorandom key and `Hkdf` struct for expanding.
+    pub fn extract(salt: Option<&[u8]>, ikm: &[u8]) -> (Output<D>, SimpleHkdf<D>) {
+        let mut extract_ctx = SimpleHkdfExtract::new(salt);
+        extract_ctx.input_ikm(ikm);
+        extract_ctx.finalize()
+    }
+
+    /// The RFC5869 HKDF-Expand operation. This is equivalent to calling
+    /// [`expand`][Hkdf::extract] with the `info` argument set equal to the
+    /// concatenation of all the elements of `info_components`.
+    pub fn expand_multi_info(
+        &self,
+        info_components: &[&[u8]],
+        okm: &mut [u8],
+    ) -> Result<(), InvalidLength> {
+        let mut prev: Option<Output<D>> = None;
+
+        let chunk_len = <D as OutputSizeUser>::OutputSize::USIZE;
+        if okm.len() > chunk_len * 255 {
+            return Err(InvalidLength);
+        }
+
+        for (block_n, block) in okm.chunks_mut(chunk_len).enumerate() {
+            let mut hmac = self.hmac.clone();
+
+            if let Some(ref prev) = prev {
+                hmac.update(prev)
+            };
+
+            // Feed in the info components in sequence. This is equivalent to feeding in the
+            // concatenation of all the info components
+            for info in info_components {
+                hmac.update(info);
+            }
+
+            hmac.update(&[block_n as u8 + 1]);
+
+            let output = hmac.finalize_fixed();
+
+            let block_len = block.len();
+            block.copy_from_slice(&output[..block_len]);
+
+            prev = Some(output);
+        }
+
+        Ok(())
+    }
+
+    /// The RFC5869 HKDF-Expand operation
+    ///
+    /// If you don't have any `info` to pass, use an empty slice.
+    pub fn expand(&self, info: &[u8], okm: &mut [u8]) -> Result<(), InvalidLength> {
+        self.expand_multi_info(&[info], okm)
+    }
+}
